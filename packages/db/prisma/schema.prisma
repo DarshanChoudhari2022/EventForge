@@ -1,0 +1,972 @@
+// ─────────────────────────────────────────────────────────────
+// EventForge — Prisma Schema
+//
+// Convention: UUID PKs everywhere, `created_at`/`updated_at` via
+// `@updatedAt` + a migration-level default, soft-delete via `deleted_at`.
+//
+// Schema map (1:1 with NestJS modules):
+//   iam          → auth, orgs, members, invites, api keys, audit log
+//   events       → events, locales, domains, venues, rooms, tracks
+//   tickets      → ticket types, orders, tickets, promo codes, waitlist
+//   agenda       → sessions, speakers, tracks, RSVPs
+//   onsite       → check-ins, badge templates, print jobs, printers
+//   engage       → attendee profiles, meetings, polls, Q&A, chat, gamification
+//   marketing    → campaigns, workflows, email events, templates
+//   analytics    → hourly rollups
+//   billing      → subscriptions, usage, invoices
+// ─────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider     = "postgresql"
+  url          = env("DATABASE_URL")
+  directUrl    = env("DIRECT_DATABASE_URL")
+  relationMode = "prisma" // Supabase pooler compat (use FK constraints in DB)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── IAM (Identity & Access Management) ──
+// ═══════════════════════════════════════════════════════════
+
+/// Organizations are the tenancy unit.  Every domain table references
+/// `organization_id`; RLS policies compare against the JWT claim.
+model Organization {
+  id                String    @id @default(uuid()) @db.Uuid
+  name              String
+  slug              String    @unique
+  defaultCurrency   String    @default("usd") @map("default_currency")
+  defaultLocale     String    @default("en") @map("default_locale")
+  brand             Json?
+  plan              String    @default("free")
+  billingCustomerId String?   @map("billing_customer_id")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  deletedAt         DateTime? @map("deleted_at")
+
+  // ── Relations ──
+  members       OrganizationMember[]
+  invites       OrganizationInvite[]
+  apiKeys       ApiKey[]
+  auditLogs     AuditLog[]
+  events        Event[]
+  printers      Printer[]
+  templates     EmailTemplate[]
+  subscriptions Subscription[]
+  usageRecords  UsageRecord[]
+  invoices      Invoice[]
+  emailEvents   EmailEvent[]
+
+  @@map("organizations")
+}
+
+/// Links a Supabase `auth.users` record to an organization with a role.
+model OrganizationMember {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  role           String    @default("viewer") // owner | admin | organizer | staff | viewer
+  status         String    @default("active") // active | suspended | invited
+  invitedAt      DateTime? @map("invited_at")
+  joinedAt       DateTime? @map("joined_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId]) // one membership per user per org
+  @@index([organizationId])
+  @@index([userId])
+  @@map("organization_members")
+}
+
+/// Open invitations (email-based) for users not yet in the system.
+model OrganizationInvite {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  email          String
+  role           String    @default("viewer")
+  invitedBy      String    @map("invited_by") @db.Uuid
+  token          String    @unique // one-time link token
+  acceptedAt     DateTime? @map("accepted_at")
+  expiresAt      DateTime  @map("expires_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([token])
+  @@map("organization_invites")
+}
+
+/// API keys scoped to an organization for public integrations / OAuth2.
+model ApiKey {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  name           String
+  keyHash        String    @map("key_hash") // SHA-256 of the plaintext key
+  keyPrefix      String    @map("key_prefix") // first 8 chars, for display
+  scopes         String[] // e.g. ["events:read", "tickets:write"]
+  lastUsedAt     DateTime? @map("last_used_at")
+  expiresAt      DateTime? @map("expires_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([keyPrefix])
+  @@map("api_keys")
+}
+
+/// Immutable audit trail for all tenant-scoped actions.
+model AuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  actorId        String?  @map("actor_id") @db.Uuid
+  action         String // e.g. "event.create", "ticket.update", "member.role_change"
+  target         String? // e.g. "Event:uuid" or "Member:uuid"
+  meta           Json? // arbitrary payload
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+  @@index([actorId])
+  @@map("audit_log")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Supabase auth.users mirror ──
+// ═══════════════════════════════════════════════════════════
+//
+// We mirror a subset of `auth.users` so Prisma can express relations.
+// The real source of truth is Supabase Auth — this table is kept in
+// sync via a DB trigger or periodic sync.
+
+model User {
+  id           String    @id @db.Uuid // matches auth.users.id
+  email        String    @unique
+  displayName  String?   @map("display_name")
+  avatarUrl    String?   @map("avatar_url")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  lastSignInAt DateTime? @map("last_sign_in_at")
+
+  memberships OrganizationMember[]
+  orders      Order[]
+
+  @@map("users")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Billing ──
+// ═══════════════════════════════════════════════════════════
+
+model Subscription {
+  id                   String   @id @default(uuid()) @db.Uuid
+  organizationId       String   @map("organization_id") @db.Uuid
+  plan                 String
+  status               String // active | past_due | canceled | trialing
+  seats                Int      @default(1)
+  currentPeriodEndsAt  DateTime @map("current_period_ends_at")
+  stripeSubscriptionId String?  @map("stripe_subscription_id")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@map("subscriptions")
+}
+
+model UsageRecord {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  metric         String // e.g. "registrations", "check_ins", "emails_sent"
+  quantity       Int      @default(1)
+  bucket         DateTime @map("bucket") // hourly / daily bucket
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, metric, bucket])
+  @@map("usage_records")
+}
+
+model Invoice {
+  id              String   @id @default(uuid()) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  stripeInvoiceId String?  @map("stripe_invoice_id")
+  totalCents      BigInt   @map("total_cents")
+  status          String // draft | open | paid | void | uncollectible
+  pdfUrl          String?  @map("pdf_url")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@map("invoices")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Events ── (Phase 1 — placeholder, filled in later)
+// ═══════════════════════════════════════════════════════════
+
+model Event {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  name           String
+  type           String    @default("in_person") // in_person | virtual | hybrid
+  status         String    @default("draft") // draft | published | live | completed | archived
+  startsAt       DateTime? @map("starts_at")
+  endsAt         DateTime? @map("ends_at")
+  timezone       String    @default("UTC")
+  currency       String    @default("usd")
+  localeDefault  String    @default("en") @map("locale_default")
+  parentEventId  String?   @map("parent_event_id") @db.Uuid // recurring parent
+  venue          Json?
+  settings       Json? // feature flags, registration config, etc.
+  publishedAt    DateTime? @map("published_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  organization     Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  locales          EventLocale[]
+  domains          EventDomain[]
+  pages            EventPage[]
+  venues           Venue[]
+  tracks           Track[]
+  ticketTypes      TicketType[]
+  orders           Order[]
+  promoCodes       PromoCode[]
+  waitlist         WaitlistEntry[]
+  sessions         Session[]
+  speakers         Speaker[]
+  exhibitors       Exhibitor[]
+  checkIns         CheckIn[]
+  badgeTemplates   BadgeTemplate[]
+  badgePrintJobs   BadgePrintJob[]
+  attendeeProfiles AttendeeProfile[]
+  campaigns        Campaign[]
+  workflows        WorkflowDefinition[]
+  metricsHourly    EventMetricHourly[]
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@map("events")
+}
+
+model EventLocale {
+  id      String  @id @default(uuid()) @db.Uuid
+  eventId String  @map("event_id") @db.Uuid
+  locale  String // e.g. "en", "fr"
+  title   String?
+  summary String?
+  content Json? // rich content blocks (hero, agenda, FAQ, CTA, etc.)
+  seo     Json? // { title, description, og_image, canonical }
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, locale])
+  @@index([eventId])
+  @@map("event_locales")
+}
+
+model EventDomain {
+  id        String @id @default(uuid()) @db.Uuid
+  eventId   String @map("event_id") @db.Uuid
+  domain    String @unique
+  sslStatus String @default("pending") @map("ssl_status") // pending | active | failed
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@map("event_domains")
+}
+
+model EventPage {
+  id           String @id @default(uuid()) @db.Uuid
+  eventId      String @map("event_id") @db.Uuid
+  slug         String
+  builderDoc   Json   @map("builder_doc") // current builder state
+  publishedDoc Json?  @map("published_doc") // frozen snapshot on publish
+  version      Int    @default(1)
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, slug])
+  @@index([eventId])
+  @@map("event_pages")
+}
+
+model Venue {
+  id        String   @id @default(uuid()) @db.Uuid
+  eventId   String   @map("event_id") @db.Uuid
+  name      String
+  address   Json?
+  capacity  Int?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  event Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  rooms Room[]
+
+  @@index([eventId])
+  @@map("venues")
+}
+
+model Room {
+  id         String  @id @default(uuid()) @db.Uuid
+  venueId    String  @map("venue_id") @db.Uuid
+  name       String
+  capacity   Int?
+  virtualUrl String? @map("virtual_url")
+
+  venue    Venue     @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  sessions Session[]
+
+  @@index([venueId])
+  @@map("rooms")
+}
+
+model Track {
+  id      String @id @default(uuid()) @db.Uuid
+  eventId String @map("event_id") @db.Uuid
+  name    String
+  color   String @default("#3b82f6")
+  sort    Int    @default(0)
+
+  event    Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  sessions Session[]
+
+  @@index([eventId])
+  @@map("tracks")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Email Templates (Marketing, shared) ──
+// ═══════════════════════════════════════════════════════════
+
+model EmailTemplate {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String
+  mjml           String // MJML source
+  variables      Json? // schema of template variables
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@map("email_templates")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Printers (Onsite) ──
+// ═══════════════════════════════════════════════════════════
+
+model Printer {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String
+  driver         String   @default("pdf") // escpos | zpl | pdf
+  connection     Json? // USB, network, WebSocket config
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  badgePrintJobs BadgePrintJob[]
+
+  @@index([organizationId])
+  @@map("printers")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Tickets (Phase 2) ──
+// ═══════════════════════════════════════════════════════════
+
+model TicketType {
+  id            String    @id @default(uuid()) @db.Uuid
+  eventId       String    @map("event_id") @db.Uuid
+  name          String
+  kind          String    @default("paid") // free | paid | donation | addon | group | hidden
+  priceCents    BigInt    @default(0) @map("price_cents")
+  currency      String    @default("usd")
+  quantityTotal Int       @default(0) @map("quantity_total") // 0 = unlimited
+  quantitySold  Int       @default(0) @map("quantity_sold")
+  saleStartsAt  DateTime? @map("sale_starts_at")
+  saleEndsAt    DateTime? @map("sale_ends_at")
+  visibility    String    @default("public") // public | hidden
+  description   String?
+  minPerOrder   Int       @default(1) @map("min_per_order")
+  maxPerOrder   Int       @default(10) @map("max_per_order")
+  sort          Int       @default(0)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  event      Event                   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  formFields RegistrationFormField[]
+  orderItems OrderItem[]
+  tickets    Ticket[]
+  promoCodes PromoCode[] // many-to-many via join table below
+  waitlist   WaitlistEntry[]
+
+  @@index([eventId])
+  @@map("ticket_types")
+}
+
+model RegistrationFormField {
+  id           String  @id @default(uuid()) @db.Uuid
+  ticketTypeId String  @map("ticket_type_id") @db.Uuid
+  label        Json // i18n: { en: "T-shirt size", fr: "..." }
+  type         String // text | textarea | choice | multiselect | file | date | phone | email | number
+  required     Boolean @default(false)
+  options      Json? // for choice/multiselect
+  conditional  Json? // { field: "x", op: "eq", value: "y" }
+  sort         Int     @default(0)
+
+  ticketType TicketType @relation(fields: [ticketTypeId], references: [id], onDelete: Cascade)
+
+  @@index([ticketTypeId])
+  @@map("registration_form_fields")
+}
+
+model Order {
+  id                      String    @id @default(uuid()) @db.Uuid
+  organizationId          String    @map("organization_id") @db.Uuid
+  eventId                 String    @map("event_id") @db.Uuid
+  buyerId                 String?   @map("buyer_id") @db.Uuid
+  status                  String    @default("pending") // pending | completed | refunded | cancelled | failed
+  subtotalCents           BigInt    @default(0) @map("subtotal_cents")
+  feesCents               BigInt    @default(0) @map("fees_cents")
+  taxCents                BigInt    @default(0) @map("tax_cents")
+  discountCents           BigInt    @default(0) @map("discount_cents")
+  totalCents              BigInt    @default(0) @map("total_cents")
+  currency                String    @default("usd")
+  promoCodeId             String?   @map("promo_code_id") @db.Uuid
+  idempotencyKey          String?   @map("idempotency_key")
+  stripePaymentIntentId   String?   @map("stripe_payment_intent_id")
+  stripeCheckoutSessionId String?   @map("stripe_checkout_session_id")
+  refundedAt              DateTime? @map("refunded_at")
+  refundAmountCents       BigInt?   @default(0) @map("refund_amount_cents")
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  event     Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  buyer     User?       @relation(fields: [buyerId], references: [id], onDelete: SetNull)
+  items     OrderItem[]
+  tickets   Ticket[]
+  promoCode PromoCode?  @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
+
+  @@unique([idempotencyKey])
+  @@index([organizationId])
+  @@index([eventId])
+  @@index([buyerId])
+  @@map("orders")
+}
+
+model OrderItem {
+  id             String  @id @default(uuid()) @db.Uuid
+  orderId        String  @map("order_id") @db.Uuid
+  ticketTypeId   String  @map("ticket_type_id") @db.Uuid
+  qty            Int     @default(1)
+  unitPriceCents BigInt  @map("unit_price_cents")
+  attendeeId     String? @map("attendee_id") @db.Uuid
+
+  order      Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  ticketType TicketType @relation(fields: [ticketTypeId], references: [id], onDelete: Restrict)
+  tickets    Ticket[]
+
+  @@index([orderId])
+  @@index([ticketTypeId])
+  @@map("order_items")
+}
+
+model Ticket {
+  id             String    @id @default(uuid()) @db.Uuid
+  orderItemId    String    @map("order_item_id") @db.Uuid
+  ticketTypeId   String    @map("ticket_type_id") @db.Uuid
+  attendeeId     String?   @map("attendee_id") @db.Uuid
+  orderId        String    @map("order_id") @db.Uuid
+  eventId        String    @map("event_id") @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  status         String    @default("valid") // valid | checked_in | refunded | cancelled
+  code           String    @unique // human+scan-friendly
+  qrSecret       String    @map("qr_secret") // HMAC for QR verification
+  attendeeData   Json?     @map("attendee_data") // form responses
+  checkedInAt    DateTime? @map("checked_in_at")
+  checkedInBy    String?   @map("checked_in_by") @db.Uuid
+  badgePrintedAt DateTime? @map("badge_printed_at")
+  refundedAt     DateTime? @map("refunded_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  orderItem  OrderItem  @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  ticketType TicketType @relation(fields: [ticketTypeId], references: [id], onDelete: Restrict)
+  order      Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  checkIns   CheckIn[]
+
+  @@index([ticketTypeId])
+  @@index([eventId])
+  @@index([organizationId])
+  @@index([qrSecret])
+  @@map("tickets")
+}
+
+model PromoCode {
+  id           String    @id @default(uuid()) @db.Uuid
+  eventId      String    @map("event_id") @db.Uuid
+  code         String
+  kind         String // flat | percent
+  value        Decimal   @db.Decimal(10, 2) // amount or %
+  maxUses      Int       @default(0) @map("max_uses") // 0 = unlimited
+  uses         Int       @default(0)
+  validFrom    DateTime? @map("valid_from")
+  validTo      DateTime? @map("valid_to")
+  appliesToAll Boolean   @default(true) @map("applies_to_all")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  event       Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticketTypes TicketType[]
+  orders      Order[]
+
+  @@unique([eventId, code])
+  @@index([eventId])
+  @@map("promo_codes")
+}
+
+model WaitlistEntry {
+  id           String    @id @default(uuid()) @db.Uuid
+  eventId      String    @map("event_id") @db.Uuid
+  ticketTypeId String    @map("ticket_type_id") @db.Uuid
+  attendeeId   String?   @map("attendee_id") @db.Uuid
+  email        String
+  position     Int
+  promotedAt   DateTime? @map("promoted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  event      Event      @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticketType TicketType @relation(fields: [ticketTypeId], references: [id], onDelete: Cascade)
+
+  @@index([eventId, ticketTypeId])
+  @@map("waitlist_entries")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Agenda (Phase 3) ──
+// ═══════════════════════════════════════════════════════════
+
+model Session {
+  id             String   @id @default(uuid()) @db.Uuid
+  eventId        String   @map("event_id") @db.Uuid
+  trackId        String?  @map("track_id") @db.Uuid
+  roomId         String?  @map("room_id") @db.Uuid
+  title          Json // i18n
+  description    Json? // i18n
+  startsAt       DateTime @map("starts_at")
+  endsAt         DateTime @map("ends_at")
+  type           String   @default("talk") // keynote | talk | workshop | panel | break | networking
+  capacity       Int?
+  requiresRsvp   Boolean  @default(false) @map("requires_rsvp")
+  streamUrl      String?  @map("stream_url")
+  streamProvider String?  @map("stream_provider") // zoom | teams | vimeo | none
+  externalId     String?  @map("external_id") // zoom meeting id, etc.
+  sort           Int      @default(0)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  event    Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  track    Track?           @relation(fields: [trackId], references: [id], onDelete: SetNull)
+  room     Room?            @relation(fields: [roomId], references: [id], onDelete: SetNull)
+  speakers SessionSpeaker[]
+  rsvps    SessionRsvp[]
+  polls    Poll[]
+
+  @@index([eventId])
+  @@index([trackId])
+  @@index([roomId])
+  @@index([startsAt])
+  @@map("sessions")
+}
+
+model Speaker {
+  id          String   @id @default(uuid()) @db.Uuid
+  eventId     String   @map("event_id") @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid // if linked to a real user (portal access)
+  name        String
+  title       String?
+  company     String?
+  bio         Json? // i18n
+  photoUrl    String?  @map("photo_url")
+  social      Json? // { twitter, linkedin, ... }
+  email       String?
+  status      String   @default("invited") // invited | confirmed | declined
+  portalToken String?  @map("portal_token")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  event    Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  sessions SessionSpeaker[]
+
+  @@index([eventId])
+  @@map("speakers")
+}
+
+model SessionSpeaker {
+  id        String @id @default(uuid()) @db.Uuid
+  sessionId String @map("session_id") @db.Uuid
+  speakerId String @map("speaker_id") @db.Uuid
+  role      String @default("speaker") // speaker | moderator | host
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  speaker Speaker @relation(fields: [speakerId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, speakerId])
+  @@index([speakerId])
+  @@map("session_speakers")
+}
+
+model SessionRsvp {
+  id          String    @id @default(uuid()) @db.Uuid
+  sessionId   String    @map("session_id") @db.Uuid
+  attendeeId  String    @map("attendee_id") @db.Uuid
+  status      String    @default("going") // going | waitlist | checked_in | cancelled
+  checkedInAt DateTime? @map("checked_in_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, attendeeId])
+  @@index([sessionId])
+  @@map("session_rsvps")
+}
+
+model Exhibitor {
+  id            String   @id @default(uuid()) @db.Uuid
+  eventId       String   @map("event_id") @db.Uuid
+  name          String
+  tier          String   @default("standard") // platinum | gold | silver | standard
+  description   String?
+  logoUrl       String?  @map("logo_url")
+  boothNumber   String?  @map("booth_number")
+  contactEmail  String?  @map("contact_email")
+  website       String?
+  brandColor    String?  @map("brand_color")
+  leadsCaptured Int      @default(0) @map("leads_captured")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  event Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  leads LeadCapture[]
+
+  @@index([eventId])
+  @@map("exhibitors")
+}
+
+model LeadCapture {
+  id          String   @id @default(uuid()) @db.Uuid
+  exhibitorId String   @map("exhibitor_id") @db.Uuid
+  attendeeId  String   @map("attendee_id") @db.Uuid
+  ticketCode  String   @map("ticket_code")
+  notes       String?
+  meta        Json?
+  capturedAt  DateTime @default(now()) @map("captured_at")
+
+  exhibitor Exhibitor @relation(fields: [exhibitorId], references: [id], onDelete: Cascade)
+
+  @@index([exhibitorId])
+  @@index([attendeeId])
+  @@map("lead_captures")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Onsite (Phase 4) ──
+// ═══════════════════════════════════════════════════════════
+
+model CheckIn {
+  id         String   @id @default(uuid()) @db.Uuid
+  eventId    String   @map("event_id") @db.Uuid
+  ticketId   String?  @unique @map("ticket_id") @db.Uuid
+  attendeeId String?  @map("attendee_id") @db.Uuid
+  sessionId  String?  @map("session_id") @db.Uuid // null = event-level, set = session-level
+  channel    String   @default("organizer_app") // kiosk | organizer_app | staff_manual | walk_in
+  method     String   @default("qr") // qr | lookup | walk_in
+  location   String?
+  staffId    String?  @map("staff_id") @db.Uuid
+  meta       Json?
+  at         DateTime @default(now())
+
+  event  Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticket Ticket? @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@index([eventId, at])
+  @@index([sessionId])
+  @@index([ticketId])
+  @@map("check_ins")
+}
+
+model BadgeTemplate {
+  id        String   @id @default(uuid()) @db.Uuid
+  eventId   String   @map("event_id") @db.Uuid
+  name      String
+  layout    Json // WYSIWYG layout doc
+  paperSize String   @default("A4") @map("paper_size") // A4 | letter | 4x6 | cr80
+  isDefault Boolean  @default(false) @map("is_default")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  event     Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  printJobs BadgePrintJob[]
+
+  @@index([eventId])
+  @@map("badge_templates")
+}
+
+model BadgePrintJob {
+  id         String    @id @default(uuid()) @db.Uuid
+  eventId    String    @map("event_id") @db.Uuid
+  ticketId   String?   @map("ticket_id") @db.Uuid
+  templateId String    @map("template_id") @db.Uuid
+  printerId  String?   @map("printer_id") @db.Uuid
+  status     String    @default("queued") // queued | rendering | ready | printed | failed
+  payload    Json? // rendered data for the badge
+  pdfUrl     String?   @map("pdf_url")
+  error      String?
+  queuedAt   DateTime  @default(now()) @map("queued_at")
+  printedAt  DateTime? @map("printed_at")
+
+  event    Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  template BadgeTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  printer  Printer?      @relation(fields: [printerId], references: [id], onDelete: SetNull)
+
+  @@index([eventId])
+  @@index([status])
+  @@map("badge_print_jobs")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Engage (Phase 5) ──
+// ═══════════════════════════════════════════════════════════
+
+model AttendeeProfile {
+  id          String   @id @default(uuid()) @db.Uuid
+  eventId     String   @map("event_id") @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid
+  ticketId    String?  @map("ticket_id") @db.Uuid
+  displayName String   @map("display_name")
+  photoUrl    String?  @map("photo_url")
+  title       String?
+  company     String?
+  interests   String[]
+  visibility  String   @default("public") // public | limited | private
+  bio         String?
+  social      Json?
+  points      Int      @default(0)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  event             Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  meetingsInitiated Meeting[] @relation("MeetingInitiator")
+  meetingsReceived  Meeting[] @relation("MeetingRecipient")
+
+  @@unique([eventId, userId])
+  @@index([eventId])
+  @@map("attendee_profiles")
+}
+
+model Meeting {
+  id          String   @id @default(uuid()) @db.Uuid
+  eventId     String   @map("event_id") @db.Uuid
+  aAttendeeId String   @map("a_attendee_id") @db.Uuid
+  bAttendeeId String   @map("b_attendee_id") @db.Uuid
+  slot        DateTime
+  status      String   @default("pending") // pending | accepted | declined | cancelled | completed
+  roomUrl     String?  @map("room_url")
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  aAttendee AttendeeProfile @relation("MeetingInitiator", fields: [aAttendeeId], references: [id], onDelete: Cascade)
+  bAttendee AttendeeProfile @relation("MeetingRecipient", fields: [bAttendeeId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@index([aAttendeeId])
+  @@index([bAttendeeId])
+  @@map("meetings")
+}
+
+model Poll {
+  id          String    @id @default(uuid()) @db.Uuid
+  sessionId   String    @map("session_id") @db.Uuid
+  question    Json // i18n
+  options     Json // [{ id, text }]
+  status      String    @default("draft") // draft | live | closed
+  multiSelect Boolean   @default(false) @map("multi_select")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  closedAt    DateTime? @map("closed_at")
+
+  session Session    @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  votes   PollVote[]
+
+  @@index([sessionId])
+  @@map("polls")
+}
+
+model PollVote {
+  id         String   @id @default(uuid()) @db.Uuid
+  pollId     String   @map("poll_id") @db.Uuid
+  attendeeId String   @map("attendee_id") @db.Uuid
+  optionId   String   @map("option_id")
+  at         DateTime @default(now())
+
+  poll Poll @relation(fields: [pollId], references: [id], onDelete: Cascade)
+
+  @@unique([pollId, attendeeId])
+  @@index([pollId])
+  @@map("poll_votes")
+}
+
+model QaMessage {
+  id          String   @id @default(uuid()) @db.Uuid
+  sessionId   String   @map("session_id") @db.Uuid
+  attendeeId  String   @map("attendee_id") @db.Uuid
+  text        String
+  status      String   @default("visible") // visible | hidden | answered
+  votes       Int      @default(0)
+  isAnonymous Boolean  @default(false) @map("is_anonymous")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([sessionId])
+  @@map("qa_messages")
+}
+
+model ChatMessage {
+  id         String   @id @default(uuid()) @db.Uuid
+  channelId  String   @map("channel_id") @db.Uuid
+  attendeeId String   @map("attendee_id") @db.Uuid
+  text       String
+  type       String   @default("message") // message | reaction | system
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([channelId, createdAt])
+  @@map("chat_messages")
+}
+
+model GamificationLedger {
+  id         String   @id @default(uuid()) @db.Uuid
+  eventId    String   @map("event_id") @db.Uuid
+  attendeeId String   @map("attendee_id") @db.Uuid
+  points     Int
+  reason     String // check_in | session_attend | poll_vote | meeting_booked | ...
+  meta       Json?
+  at         DateTime @default(now())
+
+  @@index([eventId, attendeeId])
+  @@map("gamification_ledger")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Marketing (Phase 6) ──
+// ═══════════════════════════════════════════════════════════
+
+model Campaign {
+  id             String    @id @default(uuid()) @db.Uuid
+  eventId        String    @map("event_id") @db.Uuid
+  name           String
+  subject        Json // i18n
+  bodyHtml       String    @map("body_html")
+  bodyMjml       String?   @map("body_mjml")
+  audience       Json? // segment definition
+  status         String    @default("draft") // draft | scheduled | sending | sent | cancelled
+  scheduledAt    DateTime? @map("scheduled_at")
+  sentAt         DateTime? @map("sent_at")
+  recipientCount Int       @default(0) @map("recipient_count")
+  openCount      Int       @default(0) @map("open_count")
+  clickCount     Int       @default(0) @map("click_count")
+  bounceCount    Int       @default(0) @map("bounce_count")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@map("campaigns")
+}
+
+model WorkflowDefinition {
+  id        String   @id @default(uuid()) @db.Uuid
+  eventId   String   @map("event_id") @db.Uuid
+  name      String
+  trigger   Json // { type: "ticket.purchased" | "check_in" | "schedule", ... }
+  steps     Json // [{ id, type: "email"|"wait"|"webhook"|..., config }]
+  status    String   @default("active") // active | paused | archived
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  event Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  runs  WorkflowRun[]
+
+  @@index([eventId])
+  @@map("workflow_definitions")
+}
+
+model WorkflowRun {
+  id           String    @id @default(uuid()) @db.Uuid
+  definitionId String    @map("definition_id") @db.Uuid
+  attendeeId   String?   @map("attendee_id") @db.Uuid
+  orderId      String?   @map("order_id") @db.Uuid
+  currentStep  Int       @default(0) @map("current_step")
+  state        Json?
+  status       String    @default("running") // running | completed | failed | cancelled
+  nextRunAt    DateTime? @map("next_run_at")
+  startedAt    DateTime  @default(now()) @map("started_at")
+  completedAt  DateTime? @map("completed_at")
+
+  definition WorkflowDefinition @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+
+  @@index([definitionId])
+  @@index([status])
+  @@index([nextRunAt])
+  @@map("workflow_runs")
+}
+
+model EmailEvent {
+  id             String       @id @default(uuid()) @db.Uuid
+  messageId      String       @map("message_id")
+  organizationId String       @map("organization_id") @db.Uuid
+  event          String // delivered | open | click | bounce | complaint | sent
+  recipient      String
+  meta           Json?
+  at             DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([messageId])
+  @@index([organizationId, event, at])
+  @@map("email_events")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ── Analytics (Phase 7) ──
+// ═══════════════════════════════════════════════════════════
+
+model EventMetricHourly {
+  id            String   @id @default(uuid()) @db.Uuid
+  eventId       String   @map("event_id") @db.Uuid
+  hourBucket    DateTime @map("hour_bucket")
+  registrations Int      @default(0)
+  revenueCents  BigInt   @default(0) @map("revenue_cents")
+  checkIns      Int      @default(0) @map("check_ins")
+  cancellations Int      @default(0)
+  refundsCents  BigInt   @default(0) @map("refunds_cents")
+  pageViews     Int      @default(0) @map("page_views")
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, hourBucket])
+  @@index([eventId, hourBucket])
+  @@map("event_metrics_hourly")
+}

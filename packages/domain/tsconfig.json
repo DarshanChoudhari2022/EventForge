@@ -1,0 +1,10 @@
+{
+  "extends": "@eventforge/config/tsconfig",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "composite": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*"]
+}

@@ -54,7 +54,7 @@ export type AllConfig = z.infer<typeof ConfigSchema>;
 export function configuration(): AllConfig {
   const parsed = ConfigSchema.safeParse({
     nodeEnv: process.env.NODE_ENV,
-    port: process.env.API_PORT,
+    port: process.env.PORT ?? process.env.API_PORT,
     prefix: 'v1',
     supabaseUrl: process.env.SUPABASE_URL,
     supabaseAnonKey: process.env.SUPABASE_ANON_KEY,

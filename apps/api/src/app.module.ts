@@ -8,6 +8,7 @@
 
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { configuration } from './config/configuration.js';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { ScheduleModule } from './infrastructure/scheduler/schedule.module.js';
 import { LoggerModule } from './infrastructure/logger/logger.module.js';
@@ -36,6 +37,7 @@ import { BillingModule } from './features/billing/billing.module.js';
     ConfigModule.forRoot({
       isGlobal: true,
       cache: true,
+      load: [configuration],
       envFilePath: ['.env', '../../.env'],
     }),
     LoggerModule,

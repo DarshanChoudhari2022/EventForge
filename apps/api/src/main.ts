@@ -19,6 +19,7 @@ import { ValidationPipe, Logger } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { AppModule } from './app.module.js';
+import { LoggerService } from './infrastructure/logger/logger.service.js';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter.js';
 import { type AllConfig } from './config/configuration.js';
 
@@ -36,7 +37,7 @@ async function bootstrap() {
     { bufferLogs: true },
   );
 
-  app.useLogger(app.get(Logger));
+  app.useLogger(app.get(LoggerService));
   app.flushLogs();
 
   const config = app.get(ConfigService<AllConfig, true>);
@@ -44,14 +45,12 @@ async function bootstrap() {
   const prefix = config.get<string>('prefix', 'v1');
   app.setGlobalPrefix(prefix);
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      transform: true,
-      forbidNonWhitelisted: false,
-      stopAtFirstError: false,
-    }),
-  );
+  const corsOrigins = config.get<string>('corsOrigins', 'http://localhost:3000');
+  app.enableCors({
+    origin: corsOrigins.split(',').map((o) => o.trim()),
+    credentials: true,
+  });
+
   app.useGlobalFilters(new HttpExceptionFilter());
 
   app.enableShutdownHooks();
